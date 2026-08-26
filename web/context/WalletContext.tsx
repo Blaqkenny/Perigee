@@ -168,9 +168,32 @@ const selectAll = (state: WalletState) => ({
 
 /**
  * Back-compat convenience hook returning the full wallet slice.
- * Prefer `useWalletStore(selector, shallow)` in new code to avoid re-rendering
- * on unrelated state changes (e.g. a component that only reads `address`
- * shouldn't re-render when `isModalOpen` toggles).
+ *
+ * ⚠️  Re-render warning: because this selector returns a new object on every
+ * call, the component will re-render whenever *any* field in the wallet store
+ * changes — even fields the component doesn't use.
+ *
+ * **Prefer `useWalletStore(selector)` for granular subscriptions.** For
+ * example, a component that only reads `address` should do:
+ *
+ * ```tsx
+ * const address = useWalletStore((s) => s.address);
+ * ```
+ *
+ * When you genuinely need multiple fields at once, pass `shallow` as the
+ * equality function so the component only re-renders when the selected values
+ * actually change:
+ *
+ * ```tsx
+ * const { address, isConnecting } = useWalletStore(
+ *   (s) => ({ address: s.address, isConnecting: s.isConnecting }),
+ *   shallow,
+ * );
+ * ```
+ *
+ * `useWallet()` itself uses `shallow` internally, but it still subscribes to
+ * the entire store slice — use it only in top-level connectors or when you
+ * truly need the full wallet object.
  */
 export const useWallet = () => useWalletStoreImpl(selectAll, shallow);
 
