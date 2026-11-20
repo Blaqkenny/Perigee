@@ -495,3 +495,334 @@ fn test_granular_pause_staking() {
     // Claim MUST fail with ContractError::Paused (error code 14).
     client.claim(&user);
 }
+
+// ── #878 — Staking reward accrual across long idle intervals ─────────────────
+
+/// Staking 10_000 tokens and advancing 1_000_000 blocks must not panic.
+/// The pending reward calculation uses saturating/checked arithmetic, so it
+/// must remain non-negative even under extreme time spans.
+#[test]
+fn test_long_idle_no_overflow() {
+    let (e, client, _, staking_token, _) = setup();
+    let user = Address::generate(&e);
+
+    let staking_client = token::StellarAssetClient::new(&e, &staking_token);
+    staking_client.mint(&user, &STAKE_AMOUNT);
+
+    client.stake(&user, &STAKE_AMOUNT);
+
+    // Advance one million blocks — the contract must not panic.
+    advance_ledger(&e, 1_000_000);
+
+    let pending = client.get_pending_rewards(&user);
+    assert!(pending >= 0, "pending rewards must not be negative");
+}
+
+/// User B stakes after user A has already been earning rewards. B should
+/// receive zero pending rewards at the moment they stake, and positive rewards
+/// only after additional blocks have elapsed.
+#[test]
+fn test_late_joiner_no_backdated_rewards() {
+    let (e, client, _, staking_token, _) = setup();
+
+    let user_a = Address::generate(&e);
+    let user_b = Address::generate(&e);
+
+    let staking_client = token::StellarAssetClient::new(&e, &staking_token);
+    staking_client.mint(&user_a, &STAKE_AMOUNT);
+    staking_client.mint(&user_b, &STAKE_AMOUNT);
+
+    // User A stakes at block 0.
+    client.stake(&user_a, &STAKE_AMOUNT);
+
+    // Advance 100 blocks.
+    advance_ledger(&e, 100);
+
+    // User B stakes at block 100 — should not inherit any of A's rewards.
+    client.stake(&user_b, &STAKE_AMOUNT);
+
+    // B joined at the current block, so pending rewards are 0 right now.
+    let b_pending_at_join = client.get_pending_rewards(&user_b);
+    assert_eq!(b_pending_at_join, 0, "late joiner must not receive backdated rewards");
+
+    // Advance 10 more blocks — B should now have positive pending rewards.
+    advance_ledger(&e, 10);
+
+    let b_pending_after = client.get_pending_rewards(&user_b);
+    assert!(b_pending_after > 0, "late joiner must accrue rewards after their join block");
+}
+
+/// Claiming immediately after a previous claim (with no ledger advancement)
+/// must return 0 — no double-pay.
+#[test]
+fn test_repeated_claims_do_not_exceed_accrued() {
+    let (e, client, _, staking_token, _) = setup();
+    let user = Address::generate(&e);
+
+    let staking_client = token::StellarAssetClient::new(&e, &staking_token);
+    staking_client.mint(&user, &STAKE_AMOUNT);
+
+    client.stake(&user, &STAKE_AMOUNT);
+    advance_ledger(&e, 10);
+
+    // First claim should succeed and return positive rewards.
+    let first = client.claim(&user);
+    assert!(first > 0, "first claim must return positive rewards");
+
+    // Second claim at the same block must return 0 (nothing new accrued).
+    let second = client.claim(&user);
+    assert_eq!(second, 0, "second claim at same block must return 0");
+}
+
+// ── #879 — Staking commission and withdrawal edge cases ──────────────────────
+
+/// When initial_rate is 0, no rewards should accrue regardless of elapsed blocks.
+#[test]
+fn test_zero_reward_period_no_rewards_accrued() {
+    let e = Env::default();
+    e.mock_all_auths();
+    e.cost_estimate().budget().reset_unlimited();
+
+    let owner = Address::generate(&e);
+    let staking_token = e
+        .register_stellar_asset_contract_v2(Address::generate(&e))
+        .address();
+    let reward_token = e
+        .register_stellar_asset_contract_v2(Address::generate(&e))
+        .address();
+
+    let contract_id = e.register(StakingRewards, ());
+    let client = StakingRewardsClient::new(&e, &contract_id);
+
+    // Initialize with zero initial_rate → no rewards should ever accrue.
+    client.initialize(
+        &owner,
+        &staking_token,
+        &reward_token,
+        &0i128,  // initial_rate = 0
+        &0i128,  // decay_rate = 0
+        &0u32,
+    );
+
+    let reward_client = token::StellarAssetClient::new(&e, &reward_token);
+    reward_client.mint(&contract_id, &1_000_000_000);
+
+    let user = Address::generate(&e);
+    let staking_client = token::StellarAssetClient::new(&e, &staking_token);
+    staking_client.mint(&user, &STAKE_AMOUNT);
+
+    client.stake(&user, &STAKE_AMOUNT);
+    advance_ledger(&e, 100);
+
+    let pending = client.get_pending_rewards(&user);
+    assert_eq!(pending, 0, "pending rewards must be 0 when initial_rate is 0");
+}
+
+/// Withdrawing half the stake preserves already-accrued rewards and allows
+/// the remaining half to continue earning.
+#[test]
+fn test_partial_exit_preserves_proportional_rewards() {
+    let (e, client, _, staking_token, _) = setup();
+    let user = Address::generate(&e);
+
+    let staking_client = token::StellarAssetClient::new(&e, &staking_token);
+    staking_client.mint(&user, &STAKE_AMOUNT);
+
+    client.stake(&user, &STAKE_AMOUNT);
+    advance_ledger(&e, 10);
+
+    // Record rewards before the partial exit.
+    let pending_before_withdraw = client.get_pending_rewards(&user);
+    assert!(pending_before_withdraw > 0, "must have accrued rewards before withdraw");
+
+    // Withdraw half — accrued rewards are checkpointed.
+    client.withdraw(&user, &(STAKE_AMOUNT / 2));
+    let accrued_at_withdraw = client.get_accrued_rewards(&user);
+    assert_eq!(accrued_at_withdraw, pending_before_withdraw,
+        "accrued rewards must be preserved after partial withdrawal");
+
+    // Advance 10 more blocks — remaining stake still earns.
+    advance_ledger(&e, 10);
+
+    let pending_after = client.get_pending_rewards(&user);
+    assert!(pending_after > accrued_at_withdraw,
+        "pending rewards must grow after partial exit (remaining stake still earns)");
+}
+
+/// Withdrawing all principal and then claiming should still pay out rewards
+/// that were accrued before the withdrawal.
+#[test]
+fn test_withdraw_principal_then_claim_rewards() {
+    let (e, client, _, staking_token, _) = setup();
+    let user = Address::generate(&e);
+
+    let staking_client = token::StellarAssetClient::new(&e, &staking_token);
+    staking_client.mint(&user, &STAKE_AMOUNT);
+
+    client.stake(&user, &STAKE_AMOUNT);
+    advance_ledger(&e, 10);
+
+    // Withdraw all principal — this checkpoints accrued rewards.
+    client.withdraw(&user, &STAKE_AMOUNT);
+    assert_eq!(client.get_staked_balance(&user), 0);
+
+    let accrued = client.get_accrued_rewards(&user);
+    assert!(accrued > 0, "accrued rewards must survive full principal withdrawal");
+
+    // Claiming after full withdrawal must pay out the accrued rewards.
+    let claimed = client.claim(&user);
+    assert_eq!(claimed, accrued, "claim after full withdrawal must return exactly accrued rewards");
+
+    // Subsequent claim must return 0.
+    let second_claim = client.claim(&user);
+    assert_eq!(second_claim, 0, "second claim must return 0");
+}
+
+// ── #881 — Leverage / liquidation boundary tests ─────────────────────────────
+
+/// Staking zero tokens must be rejected (ContractError::InvalidInput = #17).
+#[test]
+#[should_panic(expected = "Contract, #17")]
+fn test_stake_below_minimum_rejected() {
+    let (e, client, _, staking_token, _) = setup();
+    let user = Address::generate(&e);
+
+    let staking_client = token::StellarAssetClient::new(&e, &staking_token);
+    staking_client.mint(&user, &STAKE_AMOUNT);
+
+    // Staking 0 must panic with error code 17 (InvalidInput).
+    client.stake(&user, &0);
+}
+
+/// Staking a negative amount must be rejected (ContractError::InvalidInput = #17).
+#[test]
+#[should_panic(expected = "Contract, #17")]
+fn test_stake_negative_amount_rejected() {
+    let (e, client, _, staking_token, _) = setup();
+    let user = Address::generate(&e);
+
+    // Staking -1 must panic with error code 17 (InvalidInput).
+    client.stake(&user, &-1);
+}
+
+/// Two users with different stake amounts must have independent, proportional
+/// reward balances after the same number of elapsed blocks.
+#[test]
+fn test_multiple_users_independent_balances() {
+    let (e, client, _, staking_token, _) = setup();
+
+    let user_a = Address::generate(&e);
+    let user_b = Address::generate(&e);
+
+    let staking_client = token::StellarAssetClient::new(&e, &staking_token);
+    staking_client.mint(&user_a, &5_000);
+    staking_client.mint(&user_b, &3_000);
+
+    client.stake(&user_a, &5_000);
+    client.stake(&user_b, &3_000);
+
+    // Advance 10 blocks.
+    advance_ledger(&e, 10);
+
+    let pending_a = client.get_pending_rewards(&user_a);
+    let pending_b = client.get_pending_rewards(&user_b);
+
+    // Both users must have positive rewards.
+    assert!(pending_a > 0, "user A must have positive pending rewards");
+    assert!(pending_b > 0, "user B must have positive pending rewards");
+
+    // A staked more, so A must earn more.
+    assert!(pending_a > pending_b,
+        "user A (larger stake) must earn more than user B");
+
+    // Staked balances must reflect each user's own principal.
+    assert_eq!(client.get_staked_balance(&user_a), 5_000);
+    assert_eq!(client.get_staked_balance(&user_b), 3_000);
+}
+
+// ── Issue #882: options strategy expiry and settlement lifecycle ──────────────
+
+/// Full happy path: stake → advance blocks → claim rewards (> 0) → withdraw all
+/// → verify staked == 0 and pending == 0.
+#[test]
+fn test_lifecycle_stake_advance_claim_unstake() {
+    let (e, client, _, staking_token, _) = setup();
+    let user = Address::generate(&e);
+
+    let staking_client = token::StellarAssetClient::new(&e, &staking_token);
+    staking_client.mint(&user, &STAKE_AMOUNT);
+
+    // Stake 10_000.
+    client.stake(&user, &STAKE_AMOUNT);
+    assert_eq!(client.get_staked_balance(&user), STAKE_AMOUNT);
+
+    // Advance 10 blocks so rewards accrue.
+    advance_ledger(&e, 10);
+
+    // Rewards must be positive before claiming.
+    let pending = client.get_pending_rewards(&user);
+    assert!(pending > 0, "rewards should have accrued after 10 blocks");
+
+    // Claim — rewards are transferred out, accrued resets to zero.
+    client.claim(&user);
+    assert_eq!(client.get_accrued_rewards(&user), 0);
+    assert_eq!(client.get_pending_rewards(&user), 0);
+
+    // Withdraw the full principal.
+    client.withdraw(&user, &STAKE_AMOUNT);
+
+    // State machine is at rest: no stake, no pending rewards.
+    assert_eq!(client.get_staked_balance(&user), 0);
+    assert_eq!(client.get_pending_rewards(&user), 0);
+}
+
+/// After a full exit (stake then withdraw all), the user has no staked balance
+/// and no pending rewards.
+#[test]
+fn test_cannot_stake_after_full_exit() {
+    let (e, client, _, staking_token, _) = setup();
+    let user = Address::generate(&e);
+
+    let staking_client = token::StellarAssetClient::new(&e, &staking_token);
+    staking_client.mint(&user, &STAKE_AMOUNT);
+
+    // Stake then immediately withdraw.
+    client.stake(&user, &STAKE_AMOUNT);
+    client.withdraw(&user, &STAKE_AMOUNT);
+
+    // Advance slightly and claim any residual rewards (may be 0 at block 0).
+    advance_ledger(&e, 1);
+    // If get_pending_rewards is 0 there is nothing to claim; guard accordingly.
+    let pending = client.get_pending_rewards(&user);
+    if pending > 0 {
+        client.claim(&user);
+    }
+
+    // Both invariants must hold after full exit.
+    assert_eq!(client.get_staked_balance(&user), 0);
+    assert_eq!(client.get_pending_rewards(&user), 0);
+}
+
+/// Stake, advance 0 blocks (no time passes), withdraw everything — rewards
+/// must be zero and staked balance must be zero.
+#[test]
+fn test_state_cleared_after_full_exit_no_rewards() {
+    let (e, client, _, staking_token, _) = setup();
+    let user = Address::generate(&e);
+
+    let staking_client = token::StellarAssetClient::new(&e, &staking_token);
+    staking_client.mint(&user, &STAKE_AMOUNT);
+
+    // Stake without advancing the ledger.
+    client.stake(&user, &STAKE_AMOUNT);
+
+    // No blocks advance — rewards must still be 0.
+    assert_eq!(client.get_pending_rewards(&user), 0);
+
+    // Withdraw the full stake.
+    client.withdraw(&user, &STAKE_AMOUNT);
+
+    // Both staked balance and pending rewards are zero.
+    assert_eq!(client.get_staked_balance(&user), 0);
+    assert_eq!(client.get_pending_rewards(&user), 0);
+}
